@@ -193,7 +193,7 @@ async fn paper(
     // 2) 已提交/已批改试卷的详情接口，返回题目、标准答案与用户作答。
     let view_url = format!("{}/exam/view?cid={cid}&tid={task}", client.origin());
     if let Ok(Some(bytes)) = client.exam_json(&view_url, cancel).await {
-        if let Some(details) = qa::parse_exam_view_details(&bytes) {
+        if let Some(details) = qa::parse_exam_view_details_with_submitted(&bytes, None) {
             let image_urls: Vec<Vec<String>> = vec![Vec::new(); details.questions.len()];
             let mut paper = protocol::Paper::from_json(task, details.questions, image_urls)
                 .map_err(Error::Quiz)?;
