@@ -171,9 +171,38 @@ pub(super) fn restore_media(states: &mut BTreeMap<String, QuizState>, root: &std
 }
 async fn paper(
     client: &Client,
+    cid: &str,
     task: &str,
     cancel: &CancellationToken,
 ) -> Result<protocol::Paper, Error> {
+    // 1) 官方题单接口。官网试卷页已改为 AngularJS 前端渲染，HTML 里只有模板占位符，
+    //    题目真实来源是 /exam/getTaskPaper 的 JSON。
+    let tp_url = format!("{}/exam/getTaskPaper?tid={task}", client.origin());
+    if let Ok(Some(bytes)) = client.exam_json(&tp_url, cancel).await {
+        if let Some((questions, image_urls)) = qa::parse_paper(&bytes, client.origin()) {
+            let mut paper =
+                protocol::Paper::from_json(task, questions, image_urls).map_err(Error::Quiz)?;
+            attach_images(client, &mut paper, cancel).await?;
+            return Ok(paper);
+        }
+        if protocol::is_submitted_page(&bytes) {
+            return Err(Error::AlreadySubmitted);
+        }
+    }
+
+    // 2) 已提交/已批改试卷的详情接口，返回题目、标准答案与用户作答。
+    let view_url = format!("{}/exam/view?cid={cid}&tid={task}", client.origin());
+    if let Ok(Some(bytes)) = client.exam_json(&view_url, cancel).await {
+        if let Some(details) = qa::parse_exam_view_details(&bytes) {
+            let image_urls: Vec<Vec<String>> = vec![Vec::new(); details.questions.len()];
+            let mut paper = protocol::Paper::from_json(task, details.questions, image_urls)
+                .map_err(Error::Quiz)?;
+            attach_images(client, &mut paper, cancel).await?;
+            return Ok(paper);
+        }
+    }
+
+    // 3) 旧版服务端渲染页面，兼容保留一个版本；官网一旦彻底移除该形态可删除。
     let html = client.quiz_document(task, cancel).await?;
     let url = format!("{}/exam/{task}", client.origin())
         .parse()
@@ -182,24 +211,13 @@ async fn paper(
 
     // 防混淆策略：请求官方 /exam/getTaskPaper 获取无混淆标准题单，
     // 将 DOM 题目规范化对齐为服务端真实全局单题 ID，并纯净化题干与选项文本
-    let tp_url = format!("{}/exam/getTaskPaper?tid={task}", client.origin());
     if let Ok(tp_bytes) = client.quiz_http(&tp_url, None, cancel).await {
         if let Some((tp_questions, _)) = qa::parse_task_paper(&tp_bytes) {
             qa::align_paper_with_task_paper(&mut paper.questions, &tp_questions);
         }
     }
 
-    let mut size = 0;
-    for (q, urls) in paper.questions.iter_mut().zip(&paper.image_urls) {
-        for url in urls {
-            let image = client.quiz_image(url, cancel).await?;
-            size += image.len();
-            if size > 6 * 1024 * 1024 {
-                return Err(Error::Quiz("试卷图片过多，请使用官网处理".into()));
-            }
-            q.images.push(image);
-        }
-    }
+    attach_images(client, &mut paper, cancel).await?;
     paper.signature = format!(
         "{:x}",
         Sha1::digest(
@@ -208,6 +226,36 @@ async fn paper(
         )
     );
     Ok(paper)
+}
+
+/// 把试卷里的图片下载成 data URL 填入题目；单题最多 12 张、整卷最多 6 MB。
+async fn attach_images(
+    client: &Client,
+    paper: &mut protocol::Paper,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let questions = &mut paper.questions;
+    let image_urls = &paper.image_urls;
+    let mut size = 0usize;
+    for (question, urls) in questions.iter_mut().zip(image_urls) {
+        if urls.len() > 12 {
+            return Err(Error::Quiz("单题图片数量超过支持范围".into()));
+        }
+        for url in urls {
+            let image = match client.quiz_image(url, cancel).await {
+                Ok(image) => image,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                // 单张图片失效不应该让整张试卷不可用，跳过并保留其余题目。
+                Err(_) => continue,
+            };
+            size += image.len();
+            if size > 6 * 1024 * 1024 {
+                return Err(Error::Quiz("试卷图片过多，请使用官网处理".into()));
+            }
+            question.images.push(image);
+        }
+    }
+    Ok(())
 }
 async fn locate(
     client: &Client,
@@ -337,10 +385,17 @@ pub(super) async fn run(
             });
             return Ok(TaskStatus::AwaitingDecision);
         }
-        let fresh = match paper(&client, &task, &cancel).await {
+        let fresh = match paper(&client, &cid, &task, &cancel).await {
             Ok(p) => p,
             Err(Error::Unauthorized) => return Err(Error::Unauthorized),
             Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(Error::AlreadySubmitted) => {
+                update(&service, &ctx, |q| {
+                    q.stage = Stage::Manual;
+                    q.message = "测验已经提交或已经结束，无需再作答；可在官网查看结果".into();
+                });
+                return Ok(TaskStatus::AwaitingDecision);
+            }
             Err(_) => {
                 update(&service, &ctx, |q| {
                     q.stage = Stage::Manual;
@@ -636,7 +691,17 @@ async fn submit(
     if number(&item["finished"]) != 0.0 {
         return Ok(TaskStatus::Queued);
     }
-    let fresh = paper(client, &q.task_id, cancel).await?;
+    let fresh = match paper(client, &ctx.cid, &q.task_id, cancel).await {
+        Ok(p) => p,
+        Err(Error::AlreadySubmitted) => {
+            update(service, ctx, |q| {
+                q.stage = Stage::Manual;
+                q.message = "测验已经提交或已经结束，无需再作答；可在官网查看结果".into();
+            });
+            return Ok(TaskStatus::AwaitingDecision);
+        }
+        Err(error) => return Err(error),
+    };
     if fresh.signature != q.signature {
         update(service, ctx, |q| {
             q.signature = fresh.signature.clone();
@@ -1018,7 +1083,7 @@ impl Service {
                 Action::Generate => {
                     let q = state(self, &ctx);
                     if q.questions.is_empty() {
-                        if let Ok(p) = paper(&client, &q.task_id, &cancel).await {
+                        if let Ok(p) = paper(&client, &ctx.cid, &q.task_id, &cancel).await {
                             update(self, &ctx, |q| {
                                 q.signature = p.signature;
                                 q.questions = p.questions;
@@ -1037,7 +1102,7 @@ impl Service {
                 Action::MatchQa => {
                     let q = state(self, &ctx);
                     if q.questions.is_empty() {
-                        if let Ok(p) = paper(&client, &q.task_id, &cancel).await {
+                        if let Ok(p) = paper(&client, &ctx.cid, &q.task_id, &cancel).await {
                             update(self, &ctx, |q| {
                                 q.signature = p.signature;
                                 q.questions = p.questions;
@@ -1066,7 +1131,7 @@ impl Service {
         cid: String,
     ) -> Result<(), String> {
         super::login::local_parent(&parent)?;
-        let (account, task, epoch) = {
+        let (account, task, epoch, title) = {
             let r = self.runtime.lock().unwrap();
             let a = r.snapshot.user.as_ref().ok_or("请先登录")?.id.clone();
             let q = r
@@ -1074,7 +1139,7 @@ impl Service {
                 .quizzes
                 .get(&key(&a, &cid))
                 .ok_or("尚未找到测验")?;
-            (a, q.task_id.clone(), r.epoch)
+            (a, q.task_id.clone(), r.epoch, q.title.clone())
         };
 
         if task.parse::<u64>().ok().is_none_or(|t| t == 0) {
@@ -1116,7 +1181,11 @@ impl Service {
             &label,
             tauri::WebviewUrl::External("about:blank".parse().unwrap()),
         )
-        .title("UOOC 官方测验");
+        .title(if title.trim().is_empty() {
+            "UOOC 官方测验".to_string()
+        } else {
+            format!("UOOC 官方测验 - {}", title.trim())
+        });
         #[cfg(not(target_os = "android"))]
         let builder = builder.user_agent(super::user_agent::DESKTOP);
         #[cfg(target_os = "android")]
@@ -1389,10 +1458,13 @@ async fn fetch_task_group_content(
 
         // 若用户还未提交过题目，则临时保存答案一次(请求保存草稿api)，此时再获取题目
         if details.questions.is_empty() {
-            if let Ok(p) = paper(client, clean_tid, cancel).await {
-                // 保存答案 API（POST /exam/{tid} 保存草稿）
-                let save_url = format!("{}/exam/{clean_tid}", client.origin());
-                let _ = client.quiz_http(&save_url, Some(&p.fields), cancel).await;
+            if let Ok(p) = paper(client, cid, clean_tid, cancel).await {
+                // 保存答案 API（POST /exam/{tid} 保存草稿）：仅旧版 HTML 试卷带表单字段，
+                // JSON 试卷没有表单结构，不能盲发空表单。
+                if !p.fields.is_empty() {
+                    let save_url = format!("{}/exam/{clean_tid}", client.origin());
+                    let _ = client.quiz_http(&save_url, Some(&p.fields), cancel).await;
+                }
 
                 // 临时保存后再执行获取题目
                 if let Ok(tp_bytes) = client.quiz_http(&tp_url, None, cancel).await {
@@ -1435,7 +1507,7 @@ async fn fetch_task_group_content(
 
     // 兜底：如果依然为空，尝试从 HTML 解析
     if details.questions.is_empty() {
-        if let Ok(p) = paper(client, clean_tid, cancel).await {
+        if let Ok(p) = paper(client, cid, clean_tid, cancel).await {
             details.questions = p.questions;
         }
     }

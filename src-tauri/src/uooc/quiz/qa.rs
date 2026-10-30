@@ -2380,6 +2380,165 @@ pub(crate) fn parse_task_paper_json(val: &serde_json::Value) -> Option<(Vec<Ques
     }
 }
 
+static IMG_SRC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)<img[^>]+src=["']([^"']+)["']"#).unwrap());
+
+fn absolute_image_url(origin: &str, src: &str) -> Option<String> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return Some(src.to_string());
+    }
+    if let Some(rest) = src.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if src.starts_with('/') {
+        return Some(format!("{origin}{src}"));
+    }
+    Some(format!("{origin}/{src}"))
+}
+
+/// 去标签并收集其中的图片地址（保持出现顺序、去重）。
+fn plain_text_with_images(raw: &str, origin: &str, images: &mut Vec<String>) -> String {
+    for capture in IMG_SRC_RE.captures_iter(raw) {
+        if let Some(url) = capture
+            .get(1)
+            .and_then(|m| absolute_image_url(origin, m.as_str()))
+        {
+            if !images.iter().any(|existing| existing == &url) {
+                images.push(url);
+            }
+        }
+    }
+    strip_html_tags(raw)
+}
+
+/// 解析官方 `/exam/getTaskPaper`、`/exam/view` 的 JSON 题单，产出可直接交给 AI 的题目。
+///
+/// 与 `parse_task_paper_json` 的区别：题干/选项去掉 HTML、图片题补占位文本，
+/// 并把题目内图片的绝对地址按题收集为 `image_urls`（与题目一一对应）。
+pub(crate) fn parse_paper(raw: &[u8], origin: &str) -> Option<(Vec<Question>, Vec<Vec<String>>)> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    parse_paper_json(&value, origin)
+}
+
+pub(crate) fn parse_paper_json(
+    value: &serde_json::Value,
+    origin: &str,
+) -> Option<(Vec<Question>, Vec<Vec<String>>)> {
+    let list = value["data"]["questions"]
+        .as_array()
+        .or_else(|| value["questions"].as_array())
+        .or_else(|| value["data"].as_array())?;
+
+    let mut questions = Vec::new();
+    let mut image_urls = Vec::new();
+
+    for (index, item) in list.iter().enumerate() {
+        let qid = item["id"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| item["id"].as_str().map(str::to_string))
+            .or_else(|| item["question_id"].as_i64().map(|n| n.to_string()))
+            .or_else(|| item["question_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{index}"));
+
+        let raw_stem = item["question"]
+            .as_str()
+            .or_else(|| item["stem"].as_str())
+            .or_else(|| item["title"].as_str())
+            .or_else(|| item["content"].as_str())
+            .unwrap_or_default();
+        let mut images = Vec::new();
+        let mut stem = plain_text_with_images(raw_stem, origin, &mut images);
+        if stem.is_empty() {
+            if images.is_empty() {
+                continue;
+            }
+            stem = "请根据题目图片作答。".to_string();
+        }
+
+        let type_num = item["type"]
+            .as_i64()
+            .or_else(|| item["type"].as_str().and_then(|s| s.parse().ok()));
+        let type_str = item["type"].as_str().unwrap_or("");
+        let raw_options = item["options_app"]
+            .as_array()
+            .or_else(|| item["options"].as_array());
+        let has_options = raw_options.is_some_and(|options| !options.is_empty());
+        let mut options = Vec::new();
+        if let Some(raw_options) = raw_options {
+            for (opt_index, option) in raw_options.iter().enumerate() {
+                let id = option["key"]
+                    .as_str()
+                    .or_else(|| option["id"].as_str())
+                    .or_else(|| option["value"].as_str().filter(|v| v.len() <= 2))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| ((b'A' + opt_index as u8) as char).to_string());
+                let raw_text = option["value"]
+                    .as_str()
+                    .or_else(|| option["text"].as_str())
+                    .or_else(|| option["title"].as_str())
+                    .unwrap_or_default();
+                let before = images.len();
+                let mut text = plain_text_with_images(raw_text, origin, &mut images);
+                if text.is_empty() && images.len() > before {
+                    text = format!("图片选项 {}", options.len() + 1);
+                }
+                if text.is_empty() {
+                    continue;
+                }
+                options.push(OptionItem { id, text });
+            }
+        }
+
+        let kind = match (type_str, type_num) {
+            ("11", _) | (_, Some(11)) | ("multiple", _) => Kind::Multiple,
+            ("20", _) | (_, Some(20)) | ("judge", _) => Kind::Single,
+            ("30", _) | (_, Some(30)) | ("text", _) => Kind::Text,
+            ("40" | "50" | "essay" | "short_answer" | "subjective", _) | (_, Some(40..=100)) => {
+                Kind::Subjective
+            }
+            _ => {
+                let blanks = item["blanks"].as_u64().unwrap_or(0);
+                if !has_options && blanks == 0 {
+                    Kind::Subjective
+                } else if blanks > 0 {
+                    Kind::Text
+                } else {
+                    Kind::Single
+                }
+            }
+        };
+        if matches!(&kind, Kind::Single | Kind::Multiple) && options.len() < 2 {
+            continue;
+        }
+        let blanks = if kind == Kind::Text {
+            item["blanks"].as_u64().unwrap_or(1).max(1) as usize
+        } else {
+            0
+        };
+
+        questions.push(Question {
+            id: qid,
+            text: stem,
+            kind,
+            options,
+            blanks,
+            images: Vec::new(),
+        });
+        image_urls.push(images);
+    }
+
+    if questions.is_empty() {
+        None
+    } else {
+        Some((questions, image_urls))
+    }
+}
+
 /// 将 DOM 解析的题目（携带表单提交 binding）与 getTaskPaper 解析的真实题单对齐
 /// 从而将 DOM 题目 ID 规范化为真实单题数字 ID，同时纯净化题干与选项文本
 pub(crate) fn align_paper_with_task_paper(

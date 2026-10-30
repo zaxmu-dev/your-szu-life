@@ -134,6 +134,7 @@ pub(super) enum Error {
     Network,
     Invalid,
     UnexpectedRedirect,
+    AlreadySubmitted,
     Server(i64, String, Vec<String>),
     Quiz(String),
 }
@@ -147,6 +148,7 @@ impl Error {
             Self::Network => "UOOC 请求失败，请检查网络后重试".into(),
             Self::Invalid => "UOOC 返回数据格式无效".into(),
             Self::UnexpectedRedirect => "UOOC 返回了非登录重定向，请检查访问方式或网络".into(),
+            Self::AlreadySubmitted => "测验已经提交或已经结束，无需重复作答".into(),
             Self::Server(601, msg, details) => {
                 let detail_str = details.join("；");
                 if detail_str.contains("评价") || msg.contains("评价") {
@@ -564,6 +566,45 @@ impl Client {
             .quiz_http(&format!("{}/exam/{task}", self.base), None, cancel)
             .await?;
         String::from_utf8(bytes).map_err(|_| Error::Invalid)
+    }
+    /// 拉取 `/exam/` 下的 JSON 接口（`getTaskPaper` / `view`）。
+    ///
+    /// 官网的试卷页已改为前端渲染，HTML 里不再包含题目；这两个接口才是题目的真实来源。
+    /// 3xx、非 2xx、超大响应都返回 `Ok(None)`，让调用方按优先级继续回退。
+    pub(super) async fn exam_json(
+        &self,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let target =
+            reqwest::Url::parse(&format!("{}{}", self.base, path)).map_err(|_| Error::Invalid)?;
+        let base = reqwest::Url::parse(&self.base).map_err(|_| Error::Invalid)?;
+        if target.origin() != base.origin()
+            || !target.path().starts_with("/exam/")
+            || !target.username().is_empty()
+            || target.password().is_some()
+        {
+            return Err(Error::Invalid);
+        }
+        let request = self
+            .http
+            .get(target)
+            .header("Accept", "application/json, text/html;q=0.9");
+        tokio::select! { biased; _=cancel.cancelled()=>Err(Error::Cancelled),r=async {
+            let mut response=request.send().await.map_err(|_|Error::Network)?;
+            match response.status().as_u16(){
+                401=>return Err(Error::Unauthorized),
+                403=>return Err(Error::Forbidden),
+                200..=299=>{}
+                _=>return Ok(None),
+            }
+            let mut bytes=vec![];
+            while let Some(chunk)=response.chunk().await.map_err(|_|Error::Network)?{
+                if bytes.len()+chunk.len()>4*1024*1024{return Ok(None);}
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(bytes))
+        }=>r}
     }
     pub(super) async fn quiz_http(
         &self,

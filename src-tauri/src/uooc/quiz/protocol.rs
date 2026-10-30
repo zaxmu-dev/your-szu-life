@@ -238,6 +238,38 @@ impl Paper {
         }
         Ok(fields)
     }
+
+    /// 用官方 JSON 题单（`/exam/getTaskPaper` 或 `/exam/view`）构造试卷。
+    ///
+    /// JSON 里没有表单结构，因此 `fields` 为空、`action` 为 `None`：
+    /// `submit()` 会走已有的「请到官网提交」安全回退，不会误提交。
+    pub(crate) fn from_json(
+        task_id: &str,
+        questions: Vec<Question>,
+        image_urls: Vec<Vec<String>>,
+    ) -> Result<Self, String> {
+        let bindings = questions
+            .iter()
+            .map(|q| vec![q.id.clone()])
+            .collect::<Vec<_>>();
+        let identity =
+            serde_json::to_vec(&(task_id, &questions, &bindings)).map_err(|_| "试卷格式无效")?;
+        let signature = format!("{:x}", Sha1::digest(identity));
+        Ok(Self {
+            questions,
+            signature,
+            fields: vec![],
+            bindings,
+            image_urls,
+            action: None,
+        })
+    }
+}
+
+/// 已提交/已结束的测验在 `getTaskPaper` 上会返回 200 + 错误页而不是 JSON。
+pub(crate) fn is_submitted_page(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    text.contains("任务已经提交") || text.contains("不能再做")
 }
 pub(super) fn resource_id(v: &Value) -> Option<String> {
     super::super::model::id(&v["res_id"])

@@ -1,4 +1,5 @@
 use super::*;
+use super::model::{Kind, OptionItem, Question};
 use crate::uooc::{
     ai,
     model::*,
@@ -491,4 +492,83 @@ async fn jev_uses_systemone_and_requests_only_one_main_model_recheck() {
     assert_eq!(reviews.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn official_task_paper_json_becomes_answerable_questions() {
+    let raw = serde_json::to_vec(&json!({
+        "code": 1,
+        "data": {
+            "questions": [
+                {
+                    "id": 725240406,
+                    "type": "10",
+                    "question": "<p>下列哪项正确？</p>",
+                    "options_app": [
+                        {"key": "A", "value": "<p><img src=\"http://assets.uooconline.com/a.png\"></p>"},
+                        {"key": "B", "value": "<p>选项 B</p>"}
+                    ]
+                },
+                {
+                    "id": 1338050278,
+                    "type": "11",
+                    "question": "<p>多选</p>",
+                    "options_app": [
+                        {"key": "A", "value": "甲"},
+                        {"key": "B", "value": "乙"}
+                    ]
+                }
+            ]
+        }
+    }))
+    .unwrap();
+    let (questions, images) = qa::parse_paper(&raw, "https://www.uooc.net.cn").unwrap();
+    assert_eq!(questions.len(), 2);
+    assert_eq!(questions[0].id, "725240406");
+    assert_eq!(questions[0].kind, Kind::Single);
+    assert_eq!(questions[0].text, "下列哪项正确？");
+    assert_eq!(questions[0].options[0].id, "A");
+    assert_eq!(questions[0].options[0].text, "图片选项 1");
+    assert_eq!(questions[0].options[1].text, "选项 B");
+    assert_eq!(
+        images[0],
+        vec!["http://assets.uooconline.com/a.png".to_string()]
+    );
+    assert_eq!(questions[1].kind, Kind::Multiple);
+}
+
+#[test]
+fn json_paper_has_no_form_action_so_submit_stays_manual() {
+    let questions = vec![Question {
+        id: "99".into(),
+        text: "2+2?".into(),
+        kind: Kind::Single,
+        options: vec![
+            OptionItem {
+                id: "A".into(),
+                text: "4".into(),
+            },
+            OptionItem {
+                id: "B".into(),
+                text: "5".into(),
+            },
+        ],
+        blanks: 0,
+        images: vec![],
+    }];
+    let paper = protocol::Paper::from_json("99", questions, vec![vec![]]).unwrap();
+    assert!(paper.action.is_none());
+    assert!(paper.fields.is_empty());
+    assert_eq!(paper.bindings, vec![vec!["99".to_string()]]);
+    assert_eq!(paper.signature.len(), 40);
+}
+
+#[test]
+fn submitted_error_page_is_recognized() {
+    let page =
+        "<html><head><title>错误页面</title></head><body>任务已经提交，不能再做</body></html>";
+    assert!(protocol::is_submitted_page(page.as_bytes()));
+    assert!(!protocol::is_submitted_page(
+        br#"{"code":1,"data":{"questions":[]}}"#
+    ));
 }

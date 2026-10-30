@@ -73,6 +73,10 @@ jobs:
       - name: Build desktop bundles
         run: vpr tauri build --ci --bundles ${{ matrix.bundles }}
 
+      # 放在前端构建之后：tauri::generate_context! 编译期需要 ../dist 存在。
+      - name: Run UOOC quiz tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml uooc::quiz
+
       - name: Normalize desktop bundle names
         shell: bash
         run: |
