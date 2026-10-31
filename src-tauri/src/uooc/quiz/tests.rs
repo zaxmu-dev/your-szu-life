@@ -1,4 +1,5 @@
 use super::*;
+use super::model::{Kind, OptionItem, Question};
 use crate::uooc::{
     ai,
     model::*,
@@ -557,4 +558,66 @@ async fn bank_upsert_keeps_confirmed_answers_and_uploaded_flag() {
     assert_eq!(stored.correct_answers, vec!["A".to_string()]);
     assert!(stored.uploaded);
     assert!(!stored.answers.is_empty());
+}
+
+#[test]
+fn html_question_images_are_extracted_and_stripped() {
+    let mut questions = vec![Question {
+        id: "1859195749".into(),
+        text: "<p><img src=\"http://assets.uooconline.com/upload/a.png\" alt=\"image.png\"/></p>"
+            .into(),
+        kind: Kind::Single,
+        options: vec![
+            OptionItem {
+                id: "A".into(),
+                text: "<p><img src=\"/upload/b.png?x=1&amp;y=2\"></p>".into(),
+            },
+            OptionItem {
+                id: "B".into(),
+                text: "<p>普通选项</p>".into(),
+            },
+        ],
+        blanks: 0,
+        images: vec![],
+    }];
+
+    let urls = qa::collect_question_images(&mut questions, "https://www.uooc.net.cn");
+
+    assert_eq!(questions[0].text, "请根据题目图片作答。");
+    assert_eq!(questions[0].options[0].text, "图片选项 1");
+    assert_eq!(questions[0].options[1].text, "普通选项");
+    assert_eq!(
+        urls[0],
+        vec![
+            "http://assets.uooconline.com/upload/a.png".to_string(),
+            "https://www.uooc.net.cn/upload/b.png?x=1&y=2".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn plain_questions_are_left_untouched_by_image_collection() {
+    let mut questions = vec![Question {
+        id: "1".into(),
+        text: "<p>下列哪项正确？</p>".into(),
+        kind: Kind::Single,
+        options: vec![
+            OptionItem {
+                id: "A".into(),
+                text: "<p>甲</p>".into(),
+            },
+            OptionItem {
+                id: "B".into(),
+                text: "<p>乙</p>".into(),
+            },
+        ],
+        blanks: 0,
+        images: vec![],
+    }];
+
+    let urls = qa::collect_question_images(&mut questions, "https://www.uooc.net.cn");
+
+    assert!(urls[0].is_empty());
+    assert_eq!(questions[0].text, "<p>下列哪项正确？</p>");
+    assert_eq!(questions[0].options[0].text, "<p>甲</p>");
 }

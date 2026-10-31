@@ -28,6 +28,90 @@ pub(crate) fn strip_html_tags(raw: &str) -> String {
     unescaped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+static IMG_SRC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)<img[^>]+src=["']([^"']+)["']"#).unwrap());
+
+fn absolute_image_url(origin: &str, src: &str) -> Option<String> {
+    // HTML 属性里的 & 常常被转义成 &amp;，直接请求会 404。
+    let src = src.trim().replace("&amp;", "&");
+    if src.is_empty() {
+        return None;
+    }
+    if src.starts_with("data:image/") {
+        return Some(src);
+    }
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return Some(src);
+    }
+    if let Some(rest) = src.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if src.starts_with('/') {
+        return Some(format!("{origin}{src}"));
+    }
+    Some(format!("{origin}/{src}"))
+}
+
+/// 去标签并收集其中的图片地址（保持出现顺序、去重）。
+fn plain_text_with_images(raw: &str, origin: &str, images: &mut Vec<String>) -> String {
+    for capture in IMG_SRC_RE.captures_iter(raw) {
+        if let Some(url) = capture
+            .get(1)
+            .and_then(|m| absolute_image_url(origin, m.as_str()))
+        {
+            if !images.iter().any(|existing| existing == &url) {
+                images.push(url);
+            }
+        }
+    }
+    strip_html_tags(raw)
+}
+
+/// 从题干与选项的 HTML 中提取图片地址、去除标签，返回与题目一一对应的图片地址。
+///
+/// `/exam/view` 等接口返回的题干/选项是原始 HTML，图片只存在于 `<img src>` 里；
+/// 前端不会渲染 HTML，不把地址抽出来就只剩“标签文本”，图片看起来就是空白/裂图。
+/// 只处理确实带 `<img>` 的题目，避免影响普通题目的文本与答案匹配。
+pub(crate) fn collect_question_images(
+    questions: &mut [Question],
+    origin: &str,
+) -> Vec<Vec<String>> {
+    let mut image_urls = Vec::with_capacity(questions.len());
+    for question in questions.iter_mut() {
+        let has_image = question.text.to_ascii_lowercase().contains("<img")
+            || question
+                .options
+                .iter()
+                .any(|option| option.text.to_ascii_lowercase().contains("<img"));
+        if !has_image {
+            image_urls.push(Vec::new());
+            continue;
+        }
+
+        let mut urls = Vec::new();
+        question.text = plain_text_with_images(&question.text, origin, &mut urls);
+        for (index, option) in question.options.iter_mut().enumerate() {
+            let before = urls.len();
+            let text = plain_text_with_images(&option.text, origin, &mut urls);
+            option.text = if text.is_empty() && urls.len() > before {
+                format!("图片选项 {}", index + 1)
+            } else {
+                text
+            };
+        }
+        if question.text.is_empty() && !urls.is_empty() {
+            question.text = "请根据题目图片作答。".to_string();
+        }
+        // 已经通过其它路径拿到的图片不重复抽取，避免同一张图渲染两次。
+        if !question.images.is_empty() {
+            urls.clear();
+        }
+        urls.truncate(12);
+        image_urls.push(urls);
+    }
+    image_urls
+}
+
 pub(crate) const EMBEDDING_DIMENSIONS: usize = 512;
 
 fn deserialize_flex_string<'de, D>(deserializer: D) -> Result<String, D::Error>

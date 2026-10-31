@@ -211,6 +211,40 @@ async fn paper(
     );
     Ok(paper)
 }
+
+/// 给仍带 `<img>` 的题目补齐图片（用于 `/exam/view`、`/exam/getTaskPaper` 等不回传图片字段的接口）。
+/// 单张图片失败或超过总量时只跳过图片，不影响题目本身可用。
+async fn hydrate_question_images(
+    client: &Client,
+    questions: &mut [Question],
+    cancel: &CancellationToken,
+) {
+    let has_pending = questions.iter().any(|question| {
+        question.images.is_empty()
+            && (question.text.to_ascii_lowercase().contains("<img")
+                || question
+                    .options
+                    .iter()
+                    .any(|option| option.text.to_ascii_lowercase().contains("<img")))
+    });
+    if !has_pending {
+        return;
+    }
+    let image_urls = qa::collect_question_images(questions, client.origin());
+    let mut size = 0usize;
+    for (question, urls) in questions.iter_mut().zip(image_urls) {
+        for url in urls {
+            let Ok(image) = client.quiz_image(&url, cancel).await else {
+                continue;
+            };
+            size += image.len();
+            if size > 6 * 1024 * 1024 {
+                return;
+            }
+            question.images.push(image);
+        }
+    }
+}
 async fn locate(
     client: &Client,
     cid: &str,
@@ -1472,6 +1506,10 @@ async fn fetch_task_group_content(
             details.task_title = sub.task_title.clone();
         }
     }
+
+    // `/exam/view` 与 `/exam/getTaskPaper` 的题干/选项是原始 HTML，图片不会单独返回，
+    // 这里统一抽取并下载成 data URL，保证前端能直接展示。
+    hydrate_question_images(client, &mut details.questions, cancel).await;
 
     Ok(details)
 }
